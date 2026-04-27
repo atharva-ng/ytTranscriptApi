@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -111,13 +112,74 @@ type API struct {
 	POToken       string       // optional; appended as &pot= when a track requires it
 	Logger        Logger       // optional debug logger
 	MaxRetries    int          // 0 → DefaultMaxRetries; negative → no retry
+	Proxy         ProxyConfig  // optional; routes requests through an HTTP proxy, with block-retries
+
+	proxyClientOnce sync.Once
+	proxyClient     *http.Client
 }
 
 func (a *API) httpClient() *http.Client {
 	if a.HTTPClient != nil {
 		return a.HTTPClient
 	}
+	if a.Proxy != nil {
+		a.proxyClientOnce.Do(a.initProxyClient)
+		return a.proxyClient
+	}
 	return defaultHTTPClient
+}
+
+func (a *API) initProxyClient() {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	tr.Proxy = a.Proxy.ProxyURL
+	tr.DisableKeepAlives = a.Proxy.PreventKeepAlives()
+	a.proxyClient = &http.Client{
+		Transport: tr,
+		Timeout:   DefaultRequestTimeout,
+	}
+}
+
+func (a *API) blockAttempts() int {
+	if a.Proxy == nil {
+		return 1
+	}
+	n := a.Proxy.RetriesWhenBlocked()
+	if n < 0 {
+		n = 0
+	}
+	return n + 1
+}
+
+// retryOnBlock invokes op, retrying when it returns ErrIPBlocked, up to the
+// limit defined by the configured ProxyConfig. Without a proxy, op runs once.
+func (a *API) retryOnBlock(ctx context.Context, op func() error) error {
+	attempts := a.blockAttempts()
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * 250 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrIPBlocked) {
+			return err
+		}
+		lastErr = err
+		a.logf("transcriptapi: IP blocked on attempt %d/%d, retrying", i+1, attempts)
+	}
+	return lastErr
 }
 
 func (a *API) desktopUA() string {
@@ -186,15 +248,23 @@ func (a *API) List(ctx context.Context, videoID string) (*TranscriptList, error)
 	if err := ValidateVideoID(videoID); err != nil {
 		return nil, err
 	}
-	apiKey, err := a.fetchInnertubeAPIKey(ctx, videoID)
+	var list *TranscriptList
+	err := a.retryOnBlock(ctx, func() error {
+		apiKey, err := a.fetchInnertubeAPIKey(ctx, videoID)
+		if err != nil {
+			return err
+		}
+		pr, err := a.fetchCaptionsJSON(ctx, videoID, apiKey)
+		if err != nil {
+			return err
+		}
+		list = a.buildTranscriptList(videoID, pr)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	pr, err := a.fetchCaptionsJSON(ctx, videoID, apiKey)
-	if err != nil {
-		return nil, err
-	}
-	return a.buildTranscriptList(videoID, pr), nil
+	return list, nil
 }
 
 // doRequest sends req with retries on network errors and 5xx. The request body,
@@ -447,6 +517,19 @@ func (t *Transcript) Fetch(ctx context.Context) (*FetchedTranscript, error) {
 	if api == nil {
 		api = &API{}
 	}
+	var ft *FetchedTranscript
+	err := api.retryOnBlock(ctx, func() error {
+		var err error
+		ft, err = t.fetchOnce(ctx, api)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ft, nil
+}
+
+func (t *Transcript) fetchOnce(ctx context.Context, api *API) (*FetchedTranscript, error) {
 	url := t.URL
 	if strings.Contains(url, "&exp=xpe") {
 		if api.POToken == "" {
