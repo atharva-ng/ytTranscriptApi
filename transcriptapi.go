@@ -1,7 +1,14 @@
+// Package transcriptapi fetches YouTube video transcripts by reverse-engineering
+// the InnerTube player API. It supports human-written and auto-generated captions,
+// language fallback, and on-the-fly translation.
+//
+// The zero value of API is usable. All public methods accept a context.Context
+// and respect its deadline and cancellation.
 package transcriptapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -14,27 +21,49 @@ import (
 	"time"
 )
 
-const defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+// Tunable defaults; can be overridden per-API instance.
+const (
+	DefaultMaxResponseBytes = 10 << 20 // 10 MiB
+	DefaultMaxRetries       = 3
+	DefaultRequestTimeout   = 30 * time.Second
+)
+
+const (
+	defaultDesktopUA            = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	defaultAndroidUA            = "com.google.android.youtube/20.10.38 (Linux; U; Android 13) gzip"
+	defaultAndroidClientVersion = "20.10.38"
+)
 
 const (
 	watchURL        = "https://www.youtube.com/watch?v=%s"
 	innertubeAPIURL = "https://www.youtube.com/youtubei/v1/player?key=%s"
 )
 
-var innertubeContext = map[string]any{
-	"client": map[string]any{
-		"clientName":    "ANDROID",
-		"clientVersion": "20.10.38",
-	},
-}
-
 var (
+	ErrInvalidVideoID      = errors.New("invalid YouTube video ID")
 	ErrTranscriptsDisabled = errors.New("transcripts are disabled for this video")
 	ErrNoTranscriptFound   = errors.New("no transcript found for the requested languages")
 	ErrIPBlocked           = errors.New("YouTube is blocking requests from this IP")
 	ErrVideoUnavailable    = errors.New("video unavailable")
 	ErrPoTokenRequired     = errors.New("PO token required for this transcript")
+	ErrNotTranslatable     = errors.New("transcript is not translatable")
+	ErrResponseTooLarge    = errors.New("response exceeded maximum size")
 )
+
+var (
+	videoIDRegex = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
+	apiKeyRegex  = regexp.MustCompile(`"INNERTUBE_API_KEY":\s*"([a-zA-Z0-9_-]+)"`)
+	htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
+
+	recaptchaToken = []byte(`class="g-recaptcha"`)
+
+	defaultHTTPClient = &http.Client{Timeout: DefaultRequestTimeout}
+)
+
+// Logger is an optional sink for debug events. *log.Logger satisfies it.
+type Logger interface {
+	Printf(format string, args ...any)
+}
 
 // Snippet is one timed line of a transcript.
 type Snippet struct {
@@ -54,7 +83,7 @@ type FetchedTranscript struct {
 
 // Transcript is a handle to a single transcript track. Call Fetch to download.
 type Transcript struct {
-	client       *http.Client
+	api          *API
 	VideoID      string
 	URL          string
 	Language     string
@@ -63,31 +92,85 @@ type Transcript struct {
 	Translatable bool
 }
 
-// TranscriptList groups all available transcripts for a video.
+// TranscriptList groups all available transcripts for a video. Manual and
+// Generated are keyed by language code; All preserves YouTube's original order
+// and contains every track including duplicates.
 type TranscriptList struct {
 	VideoID   string
 	Manual    map[string]*Transcript
 	Generated map[string]*Transcript
+	All       []*Transcript
 }
 
-// API is the entry point. Zero value is usable; it will create its own client.
+// API is the entry point. Zero value is usable.
 type API struct {
-	HTTPClient *http.Client
+	HTTPClient    *http.Client // shared client; defaults to a 30s-timeout client
+	UserAgent     string       // overrides desktop UA used for the watch-page scrape
+	AndroidUA     string       // overrides Android UA used for the InnerTube call
+	ClientVersion string       // overrides the Android clientVersion (bump when YouTube rotates)
+	POToken       string       // optional; appended as &pot= when a track requires it
+	Logger        Logger       // optional debug logger
+	MaxRetries    int          // 0 → DefaultMaxRetries; negative → no retry
 }
 
 func (a *API) httpClient() *http.Client {
 	if a.HTTPClient != nil {
 		return a.HTTPClient
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return defaultHTTPClient
 }
 
-// Fetch is a shortcut for List(videoID).FindTranscript(languages).Fetch().
-func (a *API) Fetch(videoID string, languages ...string) (*FetchedTranscript, error) {
+func (a *API) desktopUA() string {
+	if a.UserAgent != "" {
+		return a.UserAgent
+	}
+	return defaultDesktopUA
+}
+
+func (a *API) androidUA() string {
+	if a.AndroidUA != "" {
+		return a.AndroidUA
+	}
+	return defaultAndroidUA
+}
+
+func (a *API) clientVersion() string {
+	if a.ClientVersion != "" {
+		return a.ClientVersion
+	}
+	return defaultAndroidClientVersion
+}
+
+func (a *API) maxAttempts() int {
+	if a.MaxRetries < 0 {
+		return 1
+	}
+	if a.MaxRetries == 0 {
+		return DefaultMaxRetries
+	}
+	return a.MaxRetries
+}
+
+func (a *API) logf(format string, args ...any) {
+	if a.Logger != nil {
+		a.Logger.Printf(format, args...)
+	}
+}
+
+// ValidateVideoID reports whether id is a syntactically valid YouTube video ID.
+func ValidateVideoID(id string) error {
+	if !videoIDRegex.MatchString(id) {
+		return fmt.Errorf("%w: %q", ErrInvalidVideoID, id)
+	}
+	return nil
+}
+
+// Fetch is a shortcut for List + FindTranscript + Fetch.
+func (a *API) Fetch(ctx context.Context, videoID string, languages ...string) (*FetchedTranscript, error) {
 	if len(languages) == 0 {
 		languages = []string{"en"}
 	}
-	list, err := a.List(videoID)
+	list, err := a.List(ctx, videoID)
 	if err != nil {
 		return nil, err
 	}
@@ -95,61 +178,115 @@ func (a *API) Fetch(videoID string, languages ...string) (*FetchedTranscript, er
 	if err != nil {
 		return nil, err
 	}
-	return t.Fetch()
+	return t.Fetch(ctx)
 }
 
 // List retrieves the available transcripts for a video.
-func (a *API) List(videoID string) (*TranscriptList, error) {
-	client := a.httpClient()
-
-	apiKey, err := fetchInnertubeAPIKey(client, videoID)
+func (a *API) List(ctx context.Context, videoID string) (*TranscriptList, error) {
+	if err := ValidateVideoID(videoID); err != nil {
+		return nil, err
+	}
+	apiKey, err := a.fetchInnertubeAPIKey(ctx, videoID)
 	if err != nil {
 		return nil, err
 	}
-	captions, err := fetchCaptionsJSON(client, videoID, apiKey)
+	pr, err := a.fetchCaptionsJSON(ctx, videoID, apiKey)
 	if err != nil {
 		return nil, err
 	}
-	return buildTranscriptList(client, videoID, captions), nil
+	return a.buildTranscriptList(videoID, pr), nil
 }
 
-func doGet(client *http.Client, url string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// doRequest sends req with retries on network errors and 5xx. The request body,
+// if any, must be repeatable — http.NewRequestWithContext sets GetBody for the
+// common readers (bytes.Reader, strings.Reader, bytes.Buffer).
+func (a *API) doRequest(ctx context.Context, req *http.Request) ([]byte, error) {
+	attempts := a.maxAttempts()
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * 250 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			if req.GetBody != nil {
+				body, err := req.GetBody()
+				if err != nil {
+					return nil, err
+				}
+				req.Body = body
+			}
+		}
+		body, retry, err := a.doOnce(req)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retry {
+			return nil, err
+		}
+		a.logf("transcriptapi: %s %s attempt %d/%d failed: %v", req.Method, req.URL, attempt+1, attempts, err)
+	}
+	return nil, lastErr
+}
+
+func (a *API) doOnce(req *http.Request) (body []byte, retry bool, err error) {
+	resp, err := a.httpClient().Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, false, err
+		}
+		return nil, true, err
+	}
+	defer resp.Body.Close()
+
+	body, err = io.ReadAll(io.LimitReader(resp.Body, DefaultMaxResponseBytes+1))
+	if err != nil {
+		return nil, true, err
+	}
+	if int64(len(body)) > DefaultMaxResponseBytes {
+		return nil, false, fmt.Errorf("%w: %s %s", ErrResponseTooLarge, req.Method, req.URL)
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, false, ErrIPBlocked
+	case resp.StatusCode >= 500:
+		return nil, true, fmt.Errorf("%s %s: status %d", req.Method, req.URL, resp.StatusCode)
+	case resp.StatusCode >= 400:
+		return nil, false, fmt.Errorf("%s %s: status %d", req.Method, req.URL, resp.StatusCode)
+	}
+	return body, false, nil
+}
+
+func (a *API) get(ctx context.Context, url, userAgent string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept-Language", "en-US")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, ErrIPBlocked
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
+	req.Header.Set("User-Agent", userAgent)
+	return a.doRequest(ctx, req)
 }
 
-var apiKeyRegex = regexp.MustCompile(`"INNERTUBE_API_KEY":\s*"([a-zA-Z0-9_-]+)"`)
-
-func fetchInnertubeAPIKey(client *http.Client, videoID string) (string, error) {
-	body, err := doGet(client, fmt.Sprintf(watchURL, videoID))
+func (a *API) fetchInnertubeAPIKey(ctx context.Context, videoID string) (string, error) {
+	body, err := a.get(ctx, fmt.Sprintf(watchURL, videoID), a.desktopUA())
 	if err != nil {
 		return "", err
 	}
-	htmlText := html.UnescapeString(string(body))
-	m := apiKeyRegex.FindStringSubmatch(htmlText)
+	m := apiKeyRegex.FindSubmatch(body)
 	if len(m) != 2 {
-		if strings.Contains(htmlText, `class="g-recaptcha"`) {
+		if bytes.Contains(body, recaptchaToken) {
 			return "", ErrIPBlocked
 		}
 		return "", errors.New("could not extract INNERTUBE_API_KEY from watch page")
 	}
-	return m[1], nil
+	return string(m[1]), nil
 }
 
 type playerResponse struct {
@@ -174,38 +311,39 @@ type playerResponse struct {
 	} `json:"captions"`
 }
 
-func fetchCaptionsJSON(client *http.Client, videoID, apiKey string) (*playerResponse, error) {
-	payload, _ := json.Marshal(map[string]any{
-		"context": innertubeContext,
+func (a *API) fetchCaptionsJSON(ctx context.Context, videoID, apiKey string) (*playerResponse, error) {
+	payload, err := json.Marshal(map[string]any{
+		"context": map[string]any{
+			"client": map[string]any{
+				"clientName":    "ANDROID",
+				"clientVersion": a.clientVersion(),
+			},
+		},
 		"videoId": videoID,
 	})
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf(innertubeAPIURL, apiKey), bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("encode innertube payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(innertubeAPIURL, apiKey), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept-Language", "en-US")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", a.androidUA())
+
+	body, err := a.doRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, ErrIPBlocked
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("InnerTube player: status %d", resp.StatusCode)
-	}
 
 	var pr playerResponse
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+	if err := json.Unmarshal(body, &pr); err != nil {
 		return nil, fmt.Errorf("decode player response: %w", err)
 	}
 
 	switch pr.PlayabilityStatus.Status {
 	case "", "OK":
-		// proceed
 	case "ERROR":
 		return nil, fmt.Errorf("%w: %s", ErrVideoUnavailable, pr.PlayabilityStatus.Reason)
 	default:
@@ -218,7 +356,7 @@ func fetchCaptionsJSON(client *http.Client, videoID, apiKey string) (*playerResp
 	return &pr, nil
 }
 
-func buildTranscriptList(client *http.Client, videoID string, pr *playerResponse) *TranscriptList {
+func (a *API) buildTranscriptList(videoID string, pr *playerResponse) *TranscriptList {
 	list := &TranscriptList{
 		VideoID:   videoID,
 		Manual:    map[string]*Transcript{},
@@ -230,7 +368,7 @@ func buildTranscriptList(client *http.Client, videoID string, pr *playerResponse
 			name = track.Name.Runs[0].Text
 		}
 		t := &Transcript{
-			client:       client,
+			api:          a,
 			VideoID:      videoID,
 			URL:          strings.Replace(track.BaseURL, "&fmt=srv3", "", 1),
 			Language:     name,
@@ -238,18 +376,27 @@ func buildTranscriptList(client *http.Client, videoID string, pr *playerResponse
 			IsGenerated:  track.Kind == "asr",
 			Translatable: track.IsTranslatable,
 		}
+		list.All = append(list.All, t)
+		// First-write-wins on duplicate language codes; All preserves all of them.
 		if t.IsGenerated {
-			list.Generated[t.LanguageCode] = t
+			if _, dup := list.Generated[t.LanguageCode]; !dup {
+				list.Generated[t.LanguageCode] = t
+			} else {
+				a.logf("transcriptapi: duplicate generated track for %q on %s", t.LanguageCode, videoID)
+			}
 		} else {
-			list.Manual[t.LanguageCode] = t
+			if _, dup := list.Manual[t.LanguageCode]; !dup {
+				list.Manual[t.LanguageCode] = t
+			} else {
+				a.logf("transcriptapi: duplicate manual track for %q on %s", t.LanguageCode, videoID)
+			}
 		}
 	}
 	return list
 }
 
 // FindTranscript searches for a transcript matching one of the given language
-// codes (in priority order). Manually created transcripts are preferred over
-// auto-generated ones.
+// codes (in priority order). Manual transcripts are preferred over generated.
 func (l *TranscriptList) FindTranscript(languages []string) (*Transcript, error) {
 	for _, lang := range languages {
 		if t, ok := l.Manual[lang]; ok {
@@ -264,6 +411,28 @@ func (l *TranscriptList) FindTranscript(languages []string) (*Transcript, error)
 	return nil, fmt.Errorf("%w: requested %v", ErrNoTranscriptFound, languages)
 }
 
+// Translate returns a copy of t configured to fetch the transcript translated
+// into targetLang. Returns ErrNotTranslatable if YouTube did not flag the track
+// as translatable.
+func (t *Transcript) Translate(targetLang string) (*Transcript, error) {
+	if !t.Translatable {
+		return nil, fmt.Errorf("%w: %s", ErrNotTranslatable, t.LanguageCode)
+	}
+	tt := *t
+	tt.URL = appendQuery(t.URL, "tlang", targetLang)
+	tt.LanguageCode = targetLang
+	tt.Language = targetLang
+	return &tt, nil
+}
+
+func appendQuery(rawURL, key, value string) string {
+	sep := "&"
+	if !strings.Contains(rawURL, "?") {
+		sep = "?"
+	}
+	return rawURL + sep + key + "=" + value
+}
+
 type xmlTranscript struct {
 	Texts []struct {
 		Start    float64 `xml:"start,attr"`
@@ -272,14 +441,20 @@ type xmlTranscript struct {
 	} `xml:"text"`
 }
 
-var htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
-
 // Fetch downloads the transcript XML and returns parsed snippets.
-func (t *Transcript) Fetch() (*FetchedTranscript, error) {
-	if strings.Contains(t.URL, "&exp=xpe") {
-		return nil, ErrPoTokenRequired
+func (t *Transcript) Fetch(ctx context.Context) (*FetchedTranscript, error) {
+	api := t.api
+	if api == nil {
+		api = &API{}
 	}
-	body, err := doGet(t.client, t.URL)
+	url := t.URL
+	if strings.Contains(url, "&exp=xpe") {
+		if api.POToken == "" {
+			return nil, ErrPoTokenRequired
+		}
+		url = appendQuery(url, "pot", api.POToken)
+	}
+	body, err := api.get(ctx, url, api.desktopUA())
 	if err != nil {
 		return nil, err
 	}
