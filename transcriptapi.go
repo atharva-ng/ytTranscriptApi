@@ -385,8 +385,8 @@ func (a *API) fetchCaptionsJSON(ctx context.Context, videoID, apiKey string) (*p
 	payload, err := json.Marshal(map[string]any{
 		"context": map[string]any{
 			"client": map[string]any{
-				"clientName":    "ANDROID",
-				"clientVersion": a.clientVersion(),
+				"clientName":    "WEB",
+				"clientVersion": "2.20241120.01.00",
 			},
 		},
 		"videoId": videoID,
@@ -400,7 +400,7 @@ func (a *API) fetchCaptionsJSON(ctx context.Context, videoID, apiKey string) (*p
 	}
 	req.Header.Set("Accept-Language", "en-US")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", a.androidUA())
+	req.Header.Set("User-Agent", a.desktopUA())
 
 	body, err := a.doRequest(ctx, req)
 	if err != nil {
